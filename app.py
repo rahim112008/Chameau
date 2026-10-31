@@ -113,10 +113,10 @@ def read_ped(ped, mp):
     n_ind, n_snp = len(lines), len(snp_df)
     gt = np.full((n_ind, n_snp), np.nan, dtype=np.float32)
     ind_rows = []
+    ref = snp_df.iloc[:, 4].tolist()
     for i, l in enumerate(lines):
         ind_rows.append({"FID": l[0], "IID": l[1]})
         al = l[6:]
-        ref = snp_df.iloc[:, 4].tolist()
         for j in range(n_snp):
             a1, a2 = al[2*j], al[2*j+1]
             if a1 == "0" or a2 == "0": continue
@@ -212,6 +212,7 @@ def qc_pipeline(gt, snp_df, ind_df, msi=0.2, mss=0.1, maf_min=0.05,
         "maf_values": maf[keep_snp].tolist() if keep_snp.any() else [],
     }
     return gt_f, snp_f, ind_f, qstats
+
 # ============================================================
 # GENOSCOPE - PARTIE 2/3 : Analyses
 # ============================================================
@@ -408,22 +409,45 @@ def permutation_test_race(gt, snp_df, labels, ra, rb, n_perm=100, seed=42, max_s
     p_emp = (np.sum(np.array(perm_counts) >= n_obs) + 1)/(n_perm + 1)
     return original, float(p_emp), n_obs, perm_counts
 
-# ---------- GBLUP ----------
-def gblup_calc(gt, ind_df, pheno_df):
+# ---------- GBLUP (CORRIGÉ : h2 + n_pc) ----------
+def gblup_calc(gt, ind_df, pheno_df, h2=0.5, n_pc=0):
+    """GBLUP avec blending h² et covariables PC optionnelles."""
     X = _impute_mean(gt)
-    p = np.clip(X.mean(0)/2, 0.01, 0.99)
-    denom = 2*np.sum(p*(1-p)) or 1.0
-    G = ((X - 2*p) @ (X - 2*p).T)/denom
+    p = np.clip(X.mean(0) / 2, 0.01, 0.99)
+    denom = 2 * np.sum(p * (1 - p)) or 1.0
+    G = ((X - 2 * p) @ (X - 2 * p).T) / denom
+
     id_col = "IID" if "IID" in pheno_df.columns else pheno_df.columns[0]
     y_col = "Phenotype" if "Phenotype" in pheno_df.columns else pheno_df.columns[1]
-    ph = pheno_df[[id_col, y_col]].rename(columns={id_col: "IID", y_col: "Phenotype"})
+    ph = pheno_df[[id_col, y_col]].rename(
+        columns={id_col: "IID", y_col: "Phenotype"})
     m = ind_df[["IID"]].merge(ph, on="IID", how="inner")
-    if m.empty: raise ValueError("Aucun IID commun")
+    if m.empty:
+        raise ValueError("Aucun IID commun entre ind_df et pheno_df")
+
     idx = [ind_df.index[ind_df["IID"] == i][0] for i in m["IID"]]
     G_sub = G[np.ix_(idx, idx)]
     y = m["Phenotype"].values.astype(float)
-    try: gebv = np.linalg.solve(G_sub + np.eye(len(y)), y - y.mean())
-    except Exception: gebv = np.zeros(len(y))
+
+    # Covariables fixes : intercept + PCs optionnels
+    X_fixed = np.ones((len(y), 1))
+    if n_pc > 0:
+        X_pca = _impute_mean(gt[idx])
+        X_pca = X_pca - X_pca.mean(0)
+        U, S, _ = np.linalg.svd(X_pca, full_matrices=False)
+        pcs = U[:, :n_pc] * S[:n_pc]
+        X_fixed = np.column_stack([X_fixed, pcs])
+
+    # Henderson : lambda = (1-h²)/h²
+    lam = (1 - h2) / h2 if h2 > 0 else 1.0
+    try:
+        G_inv = np.linalg.inv(G_sub + lam * np.eye(len(y)))
+        beta = np.linalg.lstsq(X_fixed, y, rcond=None)[0]
+        resid = y - X_fixed @ beta
+        gebv = G_inv @ resid
+    except np.linalg.LinAlgError:
+        gebv = np.zeros(len(y))
+
     return pd.DataFrame({"IID": m["IID"], "Phenotype": y, "GEBV": gebv})
 
 # ---------- Diversité ----------
@@ -553,6 +577,47 @@ def annotate_genes_cm(snp_target, snp_full, gff, window_kb=100):
                          "WINDOW": f"±{window_kb} kb"})
     return pd.DataFrame(rows)
 
+# ---------- vep_annotate : WRAPPER UNIFIÉ (NOUVEAU) ----------
+def vep_annotate(snp_sub, species, use_api=False, gff=None):
+    """Wrapper unifié : VEP API ou annotation GFF locale."""
+    if snp_sub is None or snp_sub.empty:
+        return pd.DataFrame()
+
+    if use_api:
+        variants = [
+            f"{r['CHR']} {int(r['BP'])} . {r.get('A1', 'A')} {r.get('A2', 'G')} . . ."
+            for _, r in snp_sub.iterrows()
+        ]
+        df = run_vep_api(variants, species)
+        if df.empty:
+            return pd.DataFrame({"SNP": snp_sub["SNP"].tolist(),
+                                 "Gene": "N/A", "Consequence": "N/A",
+                                 "Impact": "N/A", "CHR": snp_sub["CHR"].tolist()})
+        df = df.rename(columns={"GENE": "Gene",
+                                "CONSEQUENCE": "Consequence",
+                                "IMPACT": "Impact",
+                                "AMINO_ACID_CHANGE": "AA_change"})
+        df["SNP"] = snp_sub["SNP"].values[:len(df)]
+        df["CHR"] = snp_sub["CHR"].values[:len(df)]
+        return df
+
+    if gff is not None and not gff.empty:
+        ann = annotate_genes_cm(snp_sub, snp_sub, gff, window_kb=100)
+        if ann.empty:
+            return pd.DataFrame({"SNP": snp_sub["SNP"].tolist(),
+                                 "Gene": "N/A", "Consequence": "Intergénique",
+                                 "Impact": "MODIFIER", "CHR": snp_sub["CHR"].tolist()})
+        ann = ann.rename(columns={"GENE": "Gene", "SNP_POS_BP": "BP"})
+        ann["Consequence"] = "Région génique (" + ann["WINDOW"] + ")"
+        ann["Impact"] = "MODIFIER"
+        return ann[["SNP", "CHR", "BP", "Gene", "Consequence", "Impact",
+                    "GENE_START", "GENE_END", "DIST_KB"]]
+
+    return pd.DataFrame({"SNP": snp_sub["SNP"].tolist(),
+                         "Gene": "N/A", "Consequence": "N/A",
+                         "Impact": "N/A", "CHR": snp_sub["CHR"].tolist()})
+
+# ---------- Enrichissement ----------
 def run_enrichment(gene_list, gene_sets=None, organism="Human"):
     try:
         import gseapy as gp
@@ -570,6 +635,28 @@ def run_enrichment(gene_list, gene_sets=None, organism="Human"):
         return df.sort_values("FDR").reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
+
+# ---------- enrich_analysis : WRAPPER UNIFIÉ (NOUVEAU) ----------
+def enrich_analysis(gene_list, database="GO_BP", p_threshold=0.05):
+    """Wrapper normalisé pour run_enrichment (Enrichr)."""
+    db_map = {
+        "GO_BP":    ["GO_Biological_Process_2023"],
+        "GO_MF":    ["GO_Molecular_Function_2023"],
+        "GO_CC":    ["GO_Cellular_Component_2023"],
+        "KEGG":     ["KEGG_2021_Human"],
+        "Reactome": ["Reactome_2022"],
+    }
+    gene_sets = db_map.get(database, ["GO_Biological_Process_2023"])
+    df = run_enrichment(gene_list, gene_sets=gene_sets, organism="Human")
+    if df.empty:
+        return pd.DataFrame()
+    df = df.rename(columns={
+        "TERM": "Term", "FDR": "fdr", "PVAL": "p_value",
+        "OVERLAP": "overlap", "GENES": "genes", "SCORE": "score",
+    })
+    if "p_value" in df.columns and p_threshold < 1.0:
+        df = df[df["p_value"] <= p_threshold].reset_index(drop=True)
+    return df
 
 def query_string_network(genes, species, required_score=400):
     if len(genes) < 2: return pd.DataFrame(), pd.DataFrame()
@@ -627,6 +714,7 @@ def build_vcf(gt, ind_df, snp_df, proj="Genome"):
         b.append(f"{r['CHR']}\t{int(r['BP'])}\t{r['SNP']}\t{ref}\t{alt}\t.\tPASS\t.\tGT\t"
                  + "\t".join(gts))
     return "\n".join(h + b) + "\n"
+
 # ============================================================
 # GENOSCOPE - PARTIE 3/3 : Plots + Interface
 # ============================================================
@@ -782,7 +870,7 @@ def _need(key, label="Données"):
         st.warning(f"⚠️ {label} manquantes."); return False
     return True
 
-# ---------- Sidebar ----------
+# ---------- Sidebar (FIX #4 : ternaire au lieu de `or` numpy) ----------
 def render_sidebar():
     st.sidebar.markdown("# 🧬 GenoScope")
     pages = {
@@ -796,12 +884,14 @@ def render_sidebar():
     }
     choice = st.sidebar.radio("Navigation", list(pages.keys()))
     st.sidebar.divider()
-    gt = _g("gt_filt") or _g("gt")
-    if _ok(gt):
+
+    # FIX #4 : plus de `or` sur des ndarray → ValueError numpy ambiguous
+    gt_display = _g("gt_filt") if _ok(_g("gt_filt")) else _g("gt")
+    if _ok(gt_display):
         st.sidebar.markdown("### 📊 Jeu actif")
-        st.sidebar.metric("Individus", gt.shape[0])
-        st.sidebar.metric("SNPs", gt.shape[1])
-        st.sidebar.metric("Missing", f"{100*np.isnan(gt).mean():.2f} %")
+        st.sidebar.metric("Individus", gt_display.shape[0])
+        st.sidebar.metric("SNPs", gt_display.shape[1])
+        st.sidebar.metric("Missing", f"{100*np.isnan(gt_display).mean():.2f} %")
     return pages[choice]
 
 # ---------- Pages ----------
@@ -901,7 +991,6 @@ def page_qc():
         st.plotly_chart(plot_missing(q["missing_ind"], q["missing_snp"]),
                         use_container_width=True)
 
-    # --- Diversité ---
     if _ok(_g("gt_filt")):
         st.divider()
         st.subheader("🧮 Diversité & filtre informatif")
@@ -1165,23 +1254,22 @@ def page_meta():
         except Exception as e: st.error(f"❌ {e}")
     if _ok(_g("meta_res")):
         st.dataframe(_g("meta_res").head(30), use_container_width=True)
+
 def page_vep():
     st.header("🔬 VEP & Annotation")
     if not _need("snp_filt"): return
     snp = _g("snp_filt")
 
-    # ----- Choix de la source de SNPs -----
     c1, c2 = st.columns([1, 2])
     with c1:
         st.markdown("### 🎯 Source des SNPs")
         source = st.radio("SNPs à annoter",
-                          ["Tous les SNPs filtrés", "Top GWAS", "SNPs manuels"],
+                          ["Tous les SNPs filtrés", "Top GWAS"],
                           index=0)
         top_n = 100
         if source == "Top GWAS":
             if _ok(_g("gwas_res")):
-                top_n = st.number_input("Nb top SNPs", 10, 5000, 100,
-                                        help="Tri par p-value croissante")
+                top_n = st.number_input("Nb top SNPs", 10, 5000, 100)
             else:
                 st.warning("⚠️ Aucun GWAS en mémoire — fallback sur tous les SNPs.")
                 source = "Tous les SNPs filtrés"
@@ -1198,12 +1286,10 @@ def page_vep():
                 if source == "Top GWAS":
                     gr = _g("gwas_res").sort_values("P").head(int(top_n))
                     targets = gr["SNP"].tolist()
-                elif source == "SNPs manuels":
-                    targets = None
                 else:
                     targets = snp["SNP"].tolist()
 
-                sub = snp if targets is None else snp[snp["SNP"].isin(targets)]
+                sub = snp[snp["SNP"].isin(targets)]
                 annot = vep_annotate(sub, _g("species") or "human",
                                       use_api=use_vep_api, gff=_g("gff"))
                 _s("snp_annot", annot)
@@ -1212,7 +1298,6 @@ def page_vep():
             except Exception as e:
                 st.error(f"❌ {e}")
 
-    # ----- Résultats -----
     if _ok(_g("snp_annot")):
         ann = _g("snp_annot")
         st.divider()
@@ -1230,7 +1315,6 @@ def page_vep():
 
         st.dataframe(ann.head(100), use_container_width=True)
 
-        # --- Graphiques ---
         t1, t2, t3 = st.tabs(["Conséquences", "Impact", "Par chromosome"])
         with t1:
             if "Consequence" in ann.columns:
@@ -1258,7 +1342,6 @@ def page_vep():
         st.download_button("⬇️ CSV annotation",
                             ann.to_csv(index=False).encode(),
                             "vep_annotation.csv", "text/csv")
-
 
 def page_enrich():
     st.header("🧩 Enrichissement fonctionnel")
@@ -1307,24 +1390,14 @@ def page_enrich():
             fig.update_layout(height=600)
             st.plotly_chart(fig, use_container_width=True)
 
-        if "Term" in er.columns and "p_value" in er.columns:
-            st.plotly_chart(
-                px.scatter(er, x="log_p",
-                           y="overlap" if "overlap" in er.columns else "p_value",
-                           hover_name="Term",
-                           title="Vue d'ensemble des termes"),
-                use_container_width=True)
-
         st.download_button("⬇️ CSV enrichissement",
                             _g("enrich_res").to_csv(index=False).encode(),
                             "enrichissement.csv", "text/csv")
-
 
 def page_gblup():
     st.header("🏗️ GBLUP")
     if not _need("gt_filt"): return
 
-    # --- Phénotypes ---
     st.markdown("### 📋 Phénotypes")
     up = st.file_uploader("Fichier phénotypes (CSV/TSV : IID, Phenotype)",
                           type=["csv", "tsv", "txt"])
@@ -1335,13 +1408,14 @@ def page_gblup():
             if "IID" not in df.columns or "Phenotype" not in df.columns:
                 st.error("❌ Le fichier doit contenir les colonnes IID et Phenotype.")
             else:
-                _s("pheno_df", df[["IID", "Phenotype"]].dropna())
-                st.success(f"✅ {len(_s('pheno_df'))} phénotypes chargés")
-                st.dataframe(_g("pheno_df").head(), use_container_width=True)
+                # FIX #5 : variable intermédiaire, plus de len(_s(...))
+                df_clean = df[["IID", "Phenotype"]].dropna()
+                _s("pheno_df", df_clean)
+                st.success(f"✅ {len(df_clean)} phénotypes chargés")
+                st.dataframe(df_clean.head(), use_container_width=True)
         except Exception as e:
             st.error(f"❌ {e}")
 
-    # Fallback : phénotypes déjà présents dans ind_filt
     if not _ok(_g("pheno_df")) and _ok(_g("ind_filt")):
         ind = _g("ind_filt")
         if "Phenotype" in ind.columns and ind["Phenotype"].notna().any():
@@ -1369,7 +1443,6 @@ def page_gblup():
             except Exception as e:
                 st.error(f"❌ {e}")
 
-    # --- Résultats ---
     if _ok(_g("gblup_df")):
         g = _g("gblup_df")
         st.divider()
@@ -1400,7 +1473,6 @@ def page_gblup():
         st.download_button("⬇️ CSV GEBV",
                             g.to_csv(index=False).encode(),
                             "gebv.csv", "text/csv")
-
 
 def page_export():
     st.header("📤 Export")
@@ -1444,7 +1516,6 @@ def page_export():
 
     st.markdown(f"**{len(available)} résultat(s) prêt(s) à l'export**")
 
-    # Aperçu groupé par catégorie
     cats = {
         "📥 Données":       ["gt_filt", "snp_filt", "ind_filt"],
         "🧪 QC & Diversité": ["qc_stats", "div_stats", "div_pop"],
@@ -1478,7 +1549,6 @@ def page_export():
                 except Exception as e:
                     st.error(f"❌ {e}")
 
-    # --- Archive ZIP complète ---
     st.divider()
     st.subheader("📦 Archive complète")
     if st.button("📦 Préparer archive ZIP"):
@@ -1510,7 +1580,6 @@ def page_export():
                 "application/zip")
         except Exception as e:
             st.error(f"❌ {e}")
-
 
 # ============================================================
 # MAIN
@@ -1555,10 +1624,8 @@ def main():
             import traceback
             st.code(traceback.format_exc())
 
-    # Footer global
     st.sidebar.divider()
     st.sidebar.caption("🧬 GenoScope v1.0 — Partie 3/3")
-
 
 if __name__ == "__main__":
     main()
